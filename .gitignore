@@ -1,0 +1,105 @@
+# ============================================================================
+# WOSOOL AI SAAS - GIT IGNORE
+# ============================================================================
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+.env.staging
+
+# Node modules
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+*.log.*
+/app/logs/
+
+# Docker volumes and data
+**/data/
+backups/
+*.sql
+*.dump
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Testing
+coverage/
+.nyc_output/
+*.lcov
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Cache directories
+.cache/
+.nx/cache/
+.yarn/cache/
+.yarn/install-state.gz
+
+# Local storage
+.local-storage/
+**/.local-storage/
+
+# Migration markers
+.migration/
+
+# SSL certificates (if stored locally)
+*.pem
+*.key
+*.crt
+*.cert
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets and keys
+secrets/
+*.secret
+*.key.json
+
+# Monitoring data
+prometheus-data/
+grafana-data/
+
+# Backup files
+*.bak
+*.backup

@@ -1,0 +1,3 @@
+[submodule "twenty-crm-forked"]
+	path = twenty-crm-forked
+	url = https://github.com/Basheirkh/twenty-crm-forked.git
