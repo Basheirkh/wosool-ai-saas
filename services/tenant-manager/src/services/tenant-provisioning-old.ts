@@ -1,20 +1,14 @@
 /**
  * Improved Tenant Provisioning Service
  * 
- * Handles creation of new tenant databases with:
- * - Transaction management (all-or-nothing)
- * - Complete preseed operations
- * - Comprehensive error handling
- * - Rollback mechanisms
- * - Idempotency support
+ * Handles creation of new tenant databases with better error handling,
+ * rollback mechanisms, and flexible schema copying.
  */
 
-import { Pool, PoolClient } from 'pg';
+import { Pool } from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import PreseedService from './preseed-service.js';
-
 const execAsync = promisify(exec);
 
 export interface TenantProvisioningRequest {
@@ -22,7 +16,6 @@ export interface TenantProvisioningRequest {
   adminEmail: string;
   adminPassword: string;
   plan?: 'free' | 'pro' | 'enterprise';
-  clerkOrgId?: string;
 }
 
 export interface TenantProvisioningResult {
@@ -32,7 +25,6 @@ export interface TenantProvisioningResult {
   databaseUrl: string;
   adminUserId: string;
   status: 'pending' | 'active';
-  preseedResult?: any;
 }
 
 class ImprovedTenantProvisioningService {
@@ -107,6 +99,31 @@ class ImprovedTenantProvisioningService {
   }
 
   /**
+   * Check if source database exists
+   */
+  private async checkSourceDatabase(): Promise<boolean> {
+    const adminDb = new Pool({
+      host: this.postgresHost,
+      port: parseInt(this.postgresPort),
+      user: this.postgresAdminUser,
+      password: this.postgresAdminPassword,
+      database: 'postgres',
+    });
+
+    try {
+      const result = await adminDb.query(
+        'SELECT 1 FROM pg_database WHERE datname = $1',
+        [this.sourceDatabaseName]
+      );
+      await adminDb.end();
+      return result.rows.length > 0;
+    } catch (error) {
+      await adminDb.end();
+      return false;
+    }
+  }
+
+  /**
    * Create PostgreSQL database
    */
   private async createDatabase(databaseName: string): Promise<void> {
@@ -146,15 +163,17 @@ class ImprovedTenantProvisioningService {
   }
 
   /**
-   * Copy schema using pg_dump
+   * Copy schema using pg_dump (with or without Docker)
    */
   private async copySchemaPgDump(databaseName: string): Promise<void> {
     try {
       let copyCommand: string;
 
       if (this.useDockerForSchemaCopy) {
+        // Use Docker exec for pg_dump
         copyCommand = `docker exec ${this.dockerContainerName} sh -c "PGPASSWORD='${this.postgresAdminPassword}' pg_dump -U ${this.postgresAdminUser} -d ${this.sourceDatabaseName} --schema=core --schema-only --no-owner --no-acl --no-tablespaces --no-privileges 2>/dev/null | PGPASSWORD='${this.postgresAdminPassword}' psql -U ${this.postgresAdminUser} -d ${databaseName} -v ON_ERROR_STOP=0 2>&1 | grep -v 'ERROR.*does not exist' | grep -v 'already exists' || true"`;
       } else {
+        // Use local pg_dump
         copyCommand = `PGPASSWORD='${this.postgresAdminPassword}' pg_dump -h ${this.postgresHost} -p ${this.postgresPort} -U ${this.postgresAdminUser} -d ${this.sourceDatabaseName} --schema=core --schema-only --no-owner --no-acl --no-tablespaces --no-privileges | PGPASSWORD='${this.postgresAdminPassword}' psql -h ${this.postgresHost} -p ${this.postgresPort} -U ${this.postgresAdminUser} -d ${databaseName} -v ON_ERROR_STOP=0`;
       }
 
@@ -196,7 +215,7 @@ class ImprovedTenantProvisioningService {
       await tenantDb.end();
 
       console.log(`✅ Schema verified: ${tableCount} tables in core schema`);
-      return tableCount >= 3;
+      return tableCount >= 3; // Expect at least 3 core tables (application, workspace, role, user)
     } catch (error) {
       await tenantDb.end();
       return false;
@@ -210,6 +229,12 @@ class ImprovedTenantProvisioningService {
     const databaseName = databaseUrl.split('/').pop() || '';
 
     console.log(`📦 Copying schema to tenant database: ${databaseName}`);
+
+    // Check if source database exists
+    const sourceExists = await this.checkSourceDatabase();
+    if (!sourceExists) {
+      throw new Error(`Source database '${this.sourceDatabaseName}' does not exist. Please create it first or set SOURCE_DATABASE_NAME to an existing database.`);
+    }
 
     // Create core schema first
     const targetDb = new Pool({
@@ -269,7 +294,7 @@ class ImprovedTenantProvisioningService {
         appId = appResult.rows[0].id;
       }
 
-      // Create workspace and role
+      // Create workspace and role in separate queries
       const workspaceId = uuidv4();
       const roleId = uuidv4();
       
@@ -308,7 +333,11 @@ class ImprovedTenantProvisioningService {
           id, email, "passwordHash"
         ) VALUES ($1, $2, $3)
         ON CONFLICT (id) DO NOTHING
-      `, [userId, email.toLowerCase(), passwordHash]);
+      `, [
+        userId,
+        email.toLowerCase(),
+        passwordHash
+      ]);
 
       console.log(`✅ Created user in tenant database`);
 
@@ -316,10 +345,35 @@ class ImprovedTenantProvisioningService {
       await tenantDb.query(`
         INSERT INTO core."userWorkspace" ("userId", "workspaceId")
         VALUES ($1, $2)
-        ON CONFLICT DO NOTHING
+        ON CONFLICT ("userId", "workspaceId") DO NOTHING
       `, [userId, workspaceId]);
 
       console.log(`✅ Added user to workspace`);
+      // Note: Role assignment happens via workspace.defaultRoleId which is set above
+
+      // CRITICAL: Mark all onboarding flags as complete to prevent wizard
+      // Note: keyValuePair table may not exist in template DB
+      // The workspace is created with ACTIVE status which should bypass onboarding
+      // If keyValuePair exists, clear onboarding flags
+      try {
+        await tenantDb.query(`
+          DELETE FROM core."keyValuePair"
+          WHERE ("userId" = $1 OR "userId" IS NULL)
+            AND ("workspaceId" = $2 OR "workspaceId" IS NULL)
+            AND key IN (
+              'ONBOARDING_CREATE_PROFILE_PENDING',
+              'ONBOARDING_CONNECT_ACCOUNT_PENDING',
+              'ONBOARDING_INVITE_TEAM_PENDING',
+              'ONBOARDING_BOOK_ONBOARDING_PENDING'
+            )
+        `, [userId, workspaceId]);
+        console.log(`✅ Cleared onboarding flags`);
+      } catch (error: any) {
+        // Table might not exist yet - that's okay, workspace is ACTIVE
+        console.log(`⚠️  keyValuePair table not found (this is okay if workspace is ACTIVE)`);
+      }
+
+      console.log(`✅ Workspace marked as ACTIVE (wizard should not show)`);
 
       return { workspaceId, roleId };
     } catch (error: any) {
@@ -366,177 +420,137 @@ class ImprovedTenantProvisioningService {
   }
 
   /**
-   * Provision a new tenant with full transaction management
+   * Provision a new tenant with improved error handling
    */
   async provisionTenant(request: TenantProvisioningRequest): Promise<TenantProvisioningResult> {
-    const { organizationName, adminEmail, adminPassword, plan = 'free', clerkOrgId } = request;
-
-    console.log(`🚀 Starting tenant provisioning: ${organizationName}`);
-
+    const startTime = Date.now();
     let tenantId: string | null = null;
     let databaseName: string | null = null;
-    let databaseUrl: string | null = null;
-    let userId: string | null = null;
-
-    const client = await this.globalDb.connect();
 
     try {
-      // Start transaction
-      await client.query('BEGIN');
-
-      // Step 1: Validate inputs
-      console.log('📋 Step 1: Validating inputs...');
+      // 1. Validate inputs
+      if (!request.organizationName) {
+        throw new Error('Missing required fields: organizationName');
+      }
       
-      if (!organizationName || organizationName.trim().length === 0) {
-        throw new Error('Organization name is required');
+      // For Clerk-based auth, adminEmail and adminPassword are optional
+      if (!request.adminEmail && !process.env.CLERK_SECRET_KEY) {
+        throw new Error('Missing required fields: adminEmail (required when Clerk is not configured)');
       }
 
-      if (adminEmail && !adminEmail.includes('@')) {
-        throw new Error('Invalid admin email');
+      // 2. Check email uniqueness (if provided)
+      if (request.adminEmail && !(await this.isEmailUnique(request.adminEmail))) {
+        throw new Error('Email already registered');
       }
 
-      // Step 2: Generate and validate slug
-      console.log('📋 Step 2: Generating unique slug...');
-      let slug = this.generateSlug(organizationName);
-
-      if (!slug) {
-        throw new Error('Cannot generate valid slug from organization name');
+      // 3. Generate unique slug
+      let slug = this.generateSlug(request.organizationName);
+      let attempts = 0;
+      while (!(await this.isSlugUnique(slug)) && attempts < 10) {
+        slug = `${slug}-${Math.floor(Math.random() * 1000)}`;
+        attempts++;
       }
 
-      // Ensure slug is unique
-      const slugUnique = await this.isSlugUnique(slug);
-      if (!slugUnique) {
-        slug = `${slug}-${Math.random().toString(36).substring(7)}`;
-        console.log(`Slug collision detected, using: ${slug}`);
+      if (attempts >= 10) {
+        throw new Error('Failed to generate unique slug');
       }
 
-      // Step 3: Create tenant registry entry (PENDING status)
-      console.log('📋 Step 3: Creating tenant registry entry...');
-      
-      tenantId = uuidv4();
+      // 4. Generate database name and URL
       databaseName = this.generateDatabaseName(slug);
-      databaseUrl = `postgresql://${this.postgresAdminUser}:${this.postgresAdminPassword}@${this.postgresHost}:${this.postgresPort}/${databaseName}`;
+      const databaseUrl = `postgresql://${this.postgresAdminUser}:${this.postgresAdminPassword}@${this.postgresHost}:${this.postgresPort}/${databaseName}`;
 
-      const registryResult = await client.query(
-        `INSERT INTO tenant_registry (
-          id, name, slug, database_name, database_url, status, plan, clerk_org_id, created_at
-        ) VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, NOW())
-        RETURNING id`,
-        [tenantId, organizationName, slug, databaseName, databaseUrl, plan, clerkOrgId || null]
+      // 5. Create tenant record in registry (status: pending)
+      tenantId = uuidv4();
+      const adminUserId = uuidv4();
+      
+      await this.globalDb.query(
+        `INSERT INTO tenant_registry 
+         (id, slug, name, database_name, database_url, status, plan, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+        [tenantId, slug, request.organizationName, databaseName, databaseUrl, 'pending', request.plan || 'free']
       );
 
-      if (registryResult.rows.length === 0) {
-        throw new Error('Failed to create tenant registry entry');
-      }
+      console.log(`📝 Created tenant registry entry: ${tenantId}`);
 
-      console.log(`✅ Created tenant registry: ${tenantId}`);
-
-      // Step 4: Create global user entry
-      console.log('📋 Step 4: Creating global user entry...');
-      
-      userId = uuidv4();
-
-      if (adminEmail) {
-        const emailUnique = await this.isEmailUnique(adminEmail);
-        if (!emailUnique) {
-          throw new Error(`Email already registered: ${adminEmail}`);
-        }
-
-        const userResult = await client.query(
-          `INSERT INTO global_users (
-            id, email, tenant_id, is_active, created_at
-          ) VALUES ($1, $2, $3, true, NOW())
-          RETURNING id`,
-          [userId, adminEmail.toLowerCase(), tenantId]
-        );
-
-        if (userResult.rows.length === 0) {
-          throw new Error('Failed to create global user');
-        }
-
-        console.log(`✅ Created global user: ${adminEmail}`);
-      }
-
-      // Commit transaction so far
-      await client.query('COMMIT');
-      console.log(`✅ Transaction committed (tenant registry created)`);
-
-      // Step 5: Create PostgreSQL database (outside transaction)
-      console.log('📋 Step 5: Creating PostgreSQL database...');
+      // 6. Create database
       await this.createDatabase(databaseName);
 
-      // Step 6: Run migrations and copy schema
-      console.log('📋 Step 6: Running migrations...');
+      // 7. Run migrations
       await this.runMigrations(databaseUrl);
 
-      // Step 7: Initialize workspace
-      console.log('📋 Step 7: Initializing workspace...');
-      const tenantDbPool = new Pool({ connectionString: databaseUrl });
-      
-      const { workspaceId } = await this.initializeWorkspace(
-        tenantDbPool,
-        organizationName,
-        slug,
-        adminEmail || `admin@${slug}.local`,
-        adminPassword || '',
-        userId
-      );
-
-      // Step 8: Run preseed operations
-      console.log('📋 Step 8: Running preseed operations...');
-      const preseedService = new PreseedService(tenantDbPool);
-      const preseedResult = await preseedService.preseedWorkspace(workspaceId, organizationName);
-
-      // Verify preseed
-      const preseedValid = await preseedService.verifyPreseed(workspaceId);
-      if (!preseedValid) {
-        throw new Error('Preseed verification failed');
+      // 8. Initialize workspace (only if email/password provided, otherwise Clerk will handle)
+      let passwordHash: string | null = null;
+      if (request.adminEmail && request.adminPassword) {
+        const bcrypt = await import('bcrypt');
+        passwordHash = await bcrypt.hash(request.adminPassword, 10);
+        
+        const tenantDb = new Pool({ connectionString: databaseUrl });
+        
+        // Wait for schema to be ready
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        await this.initializeWorkspace(
+          tenantDb,
+          request.organizationName,
+          slug,
+          request.adminEmail,
+          passwordHash,
+          adminUserId
+        );
+        
+        await tenantDb.end();
+      } else {
+        console.log('⚠️  Skipping workspace initialization - Clerk will handle user creation');
       }
 
-      await tenantDbPool.end();
+      // 9. Create global user record (if email provided)
+      if (request.adminEmail) {
+        await this.globalDb.query(
+          `INSERT INTO global_users (id, email, password_hash, tenant_id, role, is_active)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [adminUserId, request.adminEmail.toLowerCase(), passwordHash, tenantId, 'ADMIN', true]
+        );
+      }
 
-      // Step 9: Mark tenant as ACTIVE
-      console.log('📋 Step 9: Marking tenant as active...');
-      const updateResult = await this.globalDb.query(
+      // 10. Update tenant registry to active
+      await this.globalDb.query(
         `UPDATE tenant_registry 
-         SET status = 'active', updated_at = NOW()
-         WHERE id = $1`,
+         SET admin_user_id = $1, status = $2, updated_at = NOW()
+         WHERE id = $3`,
+        [adminUserId, 'active', tenantId]
+      );
+
+      // 11. Initialize tenant settings and usage
+      await this.globalDb.query(
+        `INSERT INTO tenant_settings (tenant_id, settings) VALUES ($1, '{}'::jsonb)`,
         [tenantId]
       );
 
-      if (!updateResult.rowCount) {
-        throw new Error('Failed to mark tenant as active');
-      }
+      await this.globalDb.query(
+        `INSERT INTO tenant_usage (tenant_id) VALUES ($1)`,
+        [tenantId]
+      );
 
-      console.log(`✅ Tenant provisioning completed successfully`);
+      const duration = Date.now() - startTime;
+      console.log(`✅ Tenant provisioned in ${duration}ms: ${slug}`);
 
       return {
         tenantId,
         slug,
         databaseName,
         databaseUrl,
-        adminUserId: userId,
+        adminUserId,
         status: 'active',
-        preseedResult,
       };
     } catch (error: any) {
-      console.error(`❌ Tenant provisioning failed:`, error.message);
-
-      // Rollback transaction
-      try {
-        await client.query('ROLLBACK');
-      } catch (rollbackError) {
-        console.error('Failed to rollback transaction:', rollbackError);
-      }
-
-      // Cleanup resources
+      console.error('❌ Tenant provisioning failed:', error.message);
+      
+      // Rollback on failure
       if (tenantId && databaseName) {
         await this.rollbackTenant(tenantId, databaseName);
       }
-
-      throw new Error(`Tenant provisioning failed: ${error.message}`);
-    } finally {
-      client.release();
+      
+      throw error;
     }
   }
 }

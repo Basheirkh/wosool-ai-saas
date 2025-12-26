@@ -17,6 +17,7 @@ const TenantProvisioningService = ImprovedTenantProvisioningService;
 import TenantResolverService from './services/tenant-resolver.js';
 import connectionPoolManager from './services/connection-pool.js';
 import metricsService from './services/metrics-service.js';
+import WebhookIdempotencyService from './services/webhook-idempotency.js';
 
 // Import routes
 import { createRegisterRouter } from './api/auth/register.js';
@@ -28,6 +29,7 @@ import { createClerkWebhookRouter } from './api/clerk/webhooks.js';
 import { createClerkAuthRouter } from './api/clerk/auth.js';
 import { initializeGlobalDatabase, validateGlobalDatabase } from './database/global/init.js';
 import ProvisioningQueueService from './services/provisioning-queue.js';
+import { clerkAuthMiddleware } from './middleware/clerk-auth.js';
 
 // Load environment variables
 dotenv.config();
@@ -67,6 +69,9 @@ const tenantResolver = new TenantResolverService(
   globalDb,
   process.env.JWT_SECRET || 'change-me-in-production'
 );
+
+// Initialize idempotency service
+const idempotencyService = new WebhookIdempotencyService(globalDb);
 
 // Trust proxy - required when running behind Nginx/reverse proxy
 app.set('trust proxy', true);
@@ -128,6 +133,9 @@ app.get('/health', (_req, res) => {
   });
 });
 
+// Apply auth middleware (optional - can be enabled/disabled)
+// app.use(clerkAuthMiddleware(globalDb));
+
 // API Routes
 app.use('/api/auth', createRegisterRouter(globalDb, tenantProvisioning, tenantResolver));
 app.use('/api/auth', createLoginRouter(globalDb, tenantResolver));
@@ -144,7 +152,7 @@ const adminAuthMiddleware = (req: any, res: any, next: any) => {
 
 app.use('/api/admin/dashboard', adminAuthMiddleware, createDashboardRouter(globalDb));
 app.use('/api/salla/webhook', createSallaWebhookRouter(globalDb, provisioningQueue));
-app.use('/api/clerk', createClerkWebhookRouter(globalDb, provisioningQueue, tenantProvisioning));
+app.use('/api/clerk', createClerkWebhookRouter(globalDb, provisioningQueue, tenantProvisioning, idempotencyService));
 app.use('/api/clerk/auth', createClerkAuthRouter(globalDb, process.env.JWT_SECRET || ''));
 
 // Metrics endpoint for Prometheus
@@ -218,6 +226,15 @@ async function startServer() {
     // Test global database connection
     await globalDb.query('SELECT 1');
     console.log('✅ Global database connection verified');
+
+    // Initialize idempotency service table
+    try {
+      await idempotencyService.initializeTable();
+      console.log('✅ Webhook idempotency service initialized');
+    } catch (error: any) {
+      console.warn('⚠️  Failed to initialize idempotency service:', error.message);
+      console.warn('⚠️  Webhook idempotency may not work correctly');
+    }
 
     // Start server
     app.listen(PORT, () => {
