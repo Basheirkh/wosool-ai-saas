@@ -25,6 +25,7 @@ import { createAdminRouter } from './api/admin/tenants.js';
 import { createDashboardRouter } from './api/admin/dashboard.js';
 import { createSallaWebhookRouter } from './api/salla/webhooks.js';
 import { createClerkWebhookRouter } from './api/clerk/webhooks.js';
+import { createClerkAuthRouter } from './api/clerk/auth.js';
 import { initializeGlobalDatabase, validateGlobalDatabase } from './database/global/init.js';
 import ProvisioningQueueService from './services/provisioning-queue.js';
 
@@ -88,6 +89,35 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
+// Root endpoint - API information
+app.get('/', (_req, res) => {
+  res.json({
+    service: 'tenant-manager-enterprise',
+    version: '2.0.0',
+    status: 'running',
+    endpoints: {
+      health: '/health',
+      metrics: '/metrics',
+      api: {
+        auth: {
+          'register-organization': 'POST /api/auth/register-organization',
+          'login': 'POST /api/auth/login',
+        },
+        admin: {
+          'tenants': 'GET /api/admin/tenants',
+          'stats': 'GET /api/admin/stats',
+          'dashboard': 'GET /api/admin/dashboard',
+        },
+        webhooks: {
+          'salla': 'POST /api/salla/webhook',
+          'clerk': 'POST /api/clerk/webhook',
+        },
+      },
+    },
+    documentation: 'See /health for service status',
+  });
+});
+
 // Health check
 app.get('/health', (_req, res) => {
   res.json({
@@ -115,6 +145,7 @@ const adminAuthMiddleware = (req: any, res: any, next: any) => {
 app.use('/api/admin/dashboard', adminAuthMiddleware, createDashboardRouter(globalDb));
 app.use('/api/salla/webhook', createSallaWebhookRouter(globalDb, provisioningQueue));
 app.use('/api/clerk', createClerkWebhookRouter(globalDb, provisioningQueue, tenantProvisioning));
+app.use('/api/clerk/auth', createClerkAuthRouter(globalDb, process.env.JWT_SECRET || ''));
 
 // Metrics endpoint for Prometheus
 app.get('/metrics', async (_req, res) => {

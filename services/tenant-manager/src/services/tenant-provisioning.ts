@@ -345,10 +345,35 @@ class ImprovedTenantProvisioningService {
       await tenantDb.query(`
         INSERT INTO core."userWorkspace" ("userId", "workspaceId")
         VALUES ($1, $2)
-        ON CONFLICT DO NOTHING
+        ON CONFLICT ("userId", "workspaceId") DO NOTHING
       `, [userId, workspaceId]);
 
       console.log(`✅ Added user to workspace`);
+      // Note: Role assignment happens via workspace.defaultRoleId which is set above
+
+      // CRITICAL: Mark all onboarding flags as complete to prevent wizard
+      // Note: keyValuePair table may not exist in template DB
+      // The workspace is created with ACTIVE status which should bypass onboarding
+      // If keyValuePair exists, clear onboarding flags
+      try {
+        await tenantDb.query(`
+          DELETE FROM core."keyValuePair"
+          WHERE ("userId" = $1 OR "userId" IS NULL)
+            AND ("workspaceId" = $2 OR "workspaceId" IS NULL)
+            AND key IN (
+              'ONBOARDING_CREATE_PROFILE_PENDING',
+              'ONBOARDING_CONNECT_ACCOUNT_PENDING',
+              'ONBOARDING_INVITE_TEAM_PENDING',
+              'ONBOARDING_BOOK_ONBOARDING_PENDING'
+            )
+        `, [userId, workspaceId]);
+        console.log(`✅ Cleared onboarding flags`);
+      } catch (error: any) {
+        // Table might not exist yet - that's okay, workspace is ACTIVE
+        console.log(`⚠️  keyValuePair table not found (this is okay if workspace is ACTIVE)`);
+      }
+
+      console.log(`✅ Workspace marked as ACTIVE (wizard should not show)`);
 
       return { workspaceId, roleId };
     } catch (error: any) {

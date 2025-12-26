@@ -7,13 +7,28 @@ RUN apk add --no-cache \
     postgresql-client \
     python3 \
     make \
-    g++
+    g++ \
+    libc-dev \
+    linux-headers
+
+# Configure npm for better network reliability
+RUN npm config set fetch-retries 10 && \
+    npm config set fetch-retry-mintimeout 30000 && \
+    npm config set fetch-retry-maxtimeout 300000
+
+# Set environment variables for node-gyp
+# Point to the Node.js installation directory (headers should be there)
+ENV NODE_OPTIONS="--max-old-space-size=2048"
+ENV npm_config_nodedir=/usr/local
+# Use the official dist URL instead of unofficial-builds
+ENV npm_config_disturl=https://nodejs.org/dist
 
 # Copy package files
 COPY package*.json ./
 COPY tsconfig.json ./
 
 # Install all dependencies (including dev for build)
+# The npm_config_nodedir should help node-gyp use local headers
 RUN npm install && npm cache clean --force
 
 # Copy source code

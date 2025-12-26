@@ -39,6 +39,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    ports:
+      - "3001:3001"
     networks:
       - wosool-network
     restart: unless-stopped
@@ -94,6 +96,14 @@ services:
       - TWENTY_BASE_URL=${TWENTY_BASE_URL:-http://localhost:3000/metadata}
       - TWENTY_API_KEY=${TWENTY_API_KEY:-}
       
+      # Clerk Configuration
+      - CLERK_PUBLISHABLE_KEY=${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-}
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY:-}
+      - CLERK_SIGN_IN_URL=/welcome
+      - CLERK_SIGN_UP_URL=/welcome
+      - CLERK_AFTER_SIGN_IN_URL=/
+      - CLERK_AFTER_SIGN_UP_URL=/welcome
+      
       # Node.js Optimization
       - NODE_OPTIONS=--max-old-space-size=2048
     depends_on:
@@ -101,6 +111,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    ports:
+      - "3000:3000"
     networks:
       - wosool-network
     restart: unless-stopped
